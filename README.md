@@ -305,6 +305,8 @@ cd /opt/github-new-repo-radar
 sudo scripts/install_systemd_timer.sh
 ```
 
+安装脚本会创建 `/usr/local/bin/github-new-repo-radar` 与 `/usr/local/bin/github-new-repo-radar-daily`，因此 VPS 上不需要系统级 `pip install -e .`。
+
 手动运行一次：
 
 ```bash
