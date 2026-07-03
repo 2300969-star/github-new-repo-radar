@@ -8,6 +8,7 @@ Type=oneshot
 Environment=GITHUB_RADAR_OUTPUT_DIR=/opt/github-new-repo-radar/reports
 Environment=GITHUB_RADAR_LIMIT=20
 Environment=GITHUB_RADAR_TIMEZONE=Asia/Shanghai
+Environment=GITHUB_RADAR_PAGES=2
+Environment=GITHUB_RADAR_PAGE_DELAY=2.0
 WorkingDirectory=/opt/github-new-repo-radar
 ExecStart=/usr/local/bin/github-new-repo-radar-daily
-

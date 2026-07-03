@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import math
 import os
 import re
 import sqlite3
 import sys
+import time as time_module
 import textwrap
 import urllib.error
 import urllib.parse
@@ -25,9 +28,9 @@ USER_AGENT = "github-new-repo-radar/0.1"
 
 
 RISK_PATTERNS: list[tuple[str, str, int]] = [
-    (r"trainer-archive\.zip|trainer\.exe|setup\.exe|tool\.exe", "外链 Windows 可执行文件", 34),
+    (r"trainer-archive\.zip|(?:download|run|execute|open|launch)[^\n]{0,80}(?:trainer|setup|tool)\.exe", "外链 Windows 可执行文件", 34),
     (r"password\s*[:：]\s*`?trainer2026|trainer2026", "压缩包密码", 24),
-    (r"run as administrator|administrator|管理员", "要求管理员运行", 20),
+    (r"run as administrator|as administrator|以管理员身份|管理员权限|管理员运行", "要求管理员运行", 20),
     (r"undetectab|anti[- ]?detect|avoid detection|bypass", "反检测/规避话术", 28),
     (r"memory manipulation|dll injection|process injection|code injection|memory injection|injected into game|god mode|one-hit|unlimited .*resources", "注入或游戏修改器话术", 24),
     (r"mass dm|user scraper|export.*members|bulk direct messages", "批量私信/抓取用户", 22),
@@ -145,9 +148,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--timezone", default=DEFAULT_TIMEZONE, help="IANA timezone, default: Asia/Shanghai")
     run.add_argument("--limit", type=int, default=12, help="number of repositories to analyze")
     run.add_argument("--search-page-size", type=int, default=100, help="GitHub search page size per UTC day, max 100")
+    run.add_argument("--pages", type=int, default=1, help="GitHub search pages to fetch per UTC day")
+    run.add_argument("--page-delay", type=float, default=1.5, help="seconds to sleep between GitHub search page requests")
     run.add_argument("--readme-limit", type=int, default=20, help="how many top repositories should have README fetched")
     run.add_argument("--min-stars", type=int, default=0, help="drop repositories below this star count")
-    run.add_argument("--format", choices=["html", "json", "md", "all"], default="all", help="output format")
+    run.add_argument("--format", choices=["html", "json", "md", "csv", "all"], default="all", help="output format")
     run.add_argument("--output-dir", default="./radar-output", help="directory for generated files")
     run.add_argument("--output-name", default="", help="file stem, default github-new-repos-{date}")
     run.add_argument("--github-token", default="", help="optional token; defaults to GITHUB_TOKEN env")
@@ -162,6 +167,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     history.add_argument("--db", default="./radar-output/history.sqlite", help="SQLite history path")
     history.add_argument("--limit", type=int, default=14, help="number of runs to show")
     history.add_argument("--format", choices=["table", "json"], default="table", help="output format")
+
+    trend = subparsers.add_parser("trend", help="summarize daily trends from SQLite")
+    trend.add_argument("--db", default="./radar-output/history.sqlite", help="SQLite history path")
+    trend.add_argument("--days", type=int, default=14, help="number of days to summarize")
+    trend.add_argument("--format", choices=["table", "json"], default="table", help="output format")
+
+    explain = subparsers.add_parser("explain", help="deep-analyze a single repository")
+    explain.add_argument("repo", help="repository in owner/name form")
+    explain.add_argument("--timezone", default=DEFAULT_TIMEZONE, help="IANA timezone, default: Asia/Shanghai")
+    explain.add_argument("--format", choices=["json", "md"], default="md", help="output format")
+    explain.add_argument("--output", default="", help="optional output file")
+    explain.add_argument("--github-token", default="", help="optional token; defaults to GITHUB_TOKEN env")
+
+    doctor = subparsers.add_parser("doctor", help="check environment and GitHub API access")
+    doctor.add_argument("--output-dir", default="./radar-output", help="directory to check for write access")
+    doctor.add_argument("--github-token", default="", help="optional token; defaults to GITHUB_TOKEN env")
 
     args = parser.parse_args(argv)
     if args.command is None:
@@ -198,21 +219,32 @@ def parse_github_time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def search_repositories(client: GitHubClient, days: list[date], page_size: int) -> list[dict[str, Any]]:
+def search_repositories(client: GitHubClient, days: list[date], page_size: int, pages: int = 1, page_delay: float = 1.5) -> list[dict[str, Any]]:
     page_size = max(1, min(100, page_size))
+    pages = max(1, min(10, pages))
+    page_delay = max(0.0, page_delay)
     repos: dict[str, dict[str, Any]] = {}
+    request_count = 0
     for day in days:
-        query = urllib.parse.urlencode(
-            {
-                "q": f"created:{day.isoformat()}",
-                "sort": "stars",
-                "order": "desc",
-                "per_page": str(page_size),
-            }
-        )
-        payload = client.request_json(f"{API_ROOT}/search/repositories?{query}")
-        for item in payload.get("items", []):
-            repos[item["full_name"]] = item
+        for page in range(1, pages + 1):
+            if request_count and page_delay:
+                time_module.sleep(page_delay)
+            query = urllib.parse.urlencode(
+                {
+                    "q": f"created:{day.isoformat()}",
+                    "sort": "stars",
+                    "order": "desc",
+                    "per_page": str(page_size),
+                    "page": str(page),
+                }
+            )
+            payload = client.request_json(f"{API_ROOT}/search/repositories?{query}")
+            request_count += 1
+            items = payload.get("items", [])
+            for item in items:
+                repos[item["full_name"]] = item
+            if len(items) < page_size:
+                break
     return list(repos.values())
 
 
@@ -270,7 +302,20 @@ def first_sentence(text: str, fallback: str) -> str:
     return compact(chunks[0], 170)
 
 
+def strip_meta_risk_text(text: str) -> str:
+    text = re.sub(r"(?ims)^##\s*(风险评分说明|risk scoring|risk signals).*?(?=^##\s+|\Z)", "", text)
+    text = re.sub(r"(?ims)^##\s*(常用参数|common parameters).*?(?=^##\s+|\Z)", "", text)
+    scan_lines = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if re.search(r"风险评分|风险.*识别|高风险.*识别|边界提示|命中以下|risk scoring|risk signals|detects? risk|detect high-risk", lowered):
+            continue
+        scan_lines.append(line)
+    return "\n".join(scan_lines)
+
+
 def detect_risk(text: str) -> tuple[list[str], int]:
+    text = strip_meta_risk_text(text)
     lower = text.lower()
     hits: list[str] = []
     score = 8
@@ -285,7 +330,7 @@ def detect_category(repo: dict[str, Any], readme: str, risk_hits: list[str]) -> 
     name = repo.get("full_name", "")
     desc = repo.get("description") or ""
     topics = " ".join(repo.get("topics") or [])
-    text = f"{name} {desc} {topics} {readme[:4000]}".lower()
+    text = strip_meta_risk_text(f"{name} {desc} {topics} {readme[:4000]}").lower()
 
     high_risk = any(hit in risk_hits for hit in ["外链 Windows 可执行文件", "非 GitHub 下载入口", "压缩包密码"])
     name_desc = f"{name} {desc}".lower()
@@ -511,15 +556,16 @@ def analyze_repositories(
         description = plain(repo.get("description"), "暂无描述")
         topics = repo.get("topics") or []
         full_text = f"{full_name} {description} {' '.join(topics)} {readme[:10000]}"
-        hits, risk_score = detect_risk(full_text)
+        analysis_text = strip_meta_risk_text(full_text)
+        hits, risk_score = detect_risk(analysis_text)
         category, lane = detect_category(repo, readme, hits)
         depth = score_depth(readme)
         credibility = score_credibility(repo, readme, risk_score, category)
         utility = score_utility(category, risk_score, depth)
-        novelty = score_novelty(category, full_text)
+        novelty = score_novelty(category, analysis_text)
         heat = int((int(repo.get("stargazers_count") or 0) / max_stars) * 100) if max_stars else 0
         decision = choose_decision(category, credibility, risk_score, hits)
-        label = risk_label(category, risk_score, full_text)
+        label = risk_label(category, risk_score, analysis_text)
         created = parse_github_time(repo["created_at"])
         license_info = (repo.get("license") or {}).get("spdx_id") or "NOASSERTION"
         owner = repo.get("owner") or {}
@@ -642,6 +688,73 @@ def render_markdown(report: dict[str, Any]) -> str:
 def render_html(report: dict[str, Any]) -> str:
     data = json.dumps(report, ensure_ascii=False)
     return HTML_TEMPLATE.replace("__REPORT_JSON__", data)
+
+
+def render_csv(report: dict[str, Any]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "rank",
+            "repo",
+            "html_url",
+            "stars",
+            "forks",
+            "language",
+            "category",
+            "decision",
+            "risk_label",
+            "summary",
+            "action",
+        ],
+    )
+    writer.writeheader()
+    for item in report["items"]:
+        writer.writerow(
+            {
+                "rank": item["rank"],
+                "repo": item["repo"],
+                "html_url": item["html_url"],
+                "stars": item["stars"],
+                "forks": item["forks"],
+                "language": item["language"],
+                "category": item["category"],
+                "decision": item["decision"],
+                "risk_label": item["risk_label"],
+                "summary": item["summary"],
+                "action": item["action"],
+            }
+        )
+    return buffer.getvalue()
+
+
+def dated_report_files(output_dir: Path, suffix: str) -> dict[str, str]:
+    files: dict[str, str] = {}
+    pattern = re.compile(rf"^github-new-repos-(\d{{4}}-\d{{2}}-\d{{2}})\.{re.escape(suffix)}$")
+    for path in output_dir.glob(f"github-new-repos-*.{suffix}"):
+        match = pattern.match(path.name)
+        if match:
+            files[match.group(1)] = path.name
+    return files
+
+
+def apply_history_nav(report: dict[str, Any], output_dir: Path) -> None:
+    current = report["query"]["local_date"]
+    html_files = dated_report_files(output_dir, "html")
+    html_files[current] = f"github-new-repos-{current}.html"
+    dates = sorted(html_files)
+    index = dates.index(current)
+    previous_date = dates[index - 1] if index > 0 else ""
+    next_date = dates[index + 1] if index < len(dates) - 1 else ""
+    report["history_nav"] = {
+        "index": "index.html",
+        "latest": "latest.html",
+        "previous_date": previous_date,
+        "previous": html_files.get(previous_date, ""),
+        "next_date": next_date,
+        "next": html_files.get(next_date, ""),
+        "available_dates": dates,
+    }
 
 
 def default_db_path(output_dir: Path, requested: str) -> Path:
@@ -770,6 +883,79 @@ def load_history(db_path: Path, limit: int) -> list[dict[str, Any]]:
             (max(1, limit),),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+def load_trends(db_path: Path, days: int) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        init_history_db(connection)
+        run_rows = connection.execute(
+            """
+            SELECT local_date, timezone, generated_at, included, stars, study, verify, avoid, high_risk
+            FROM runs
+            ORDER BY local_date DESC, generated_at DESC
+            LIMIT ?
+            """,
+            (max(1, days),),
+        ).fetchall()
+        trends: list[dict[str, Any]] = []
+        for row in run_rows:
+            date_key = row["local_date"]
+            tz_name = row["timezone"]
+            category_rows = connection.execute(
+                """
+                SELECT category, COUNT(*) AS count
+                FROM items
+                WHERE local_date = ? AND timezone = ?
+                GROUP BY category
+                ORDER BY count DESC, category ASC
+                LIMIT 5
+                """,
+                (date_key, tz_name),
+            ).fetchall()
+            risk_rows = connection.execute(
+                """
+                SELECT risk_label, COUNT(*) AS count
+                FROM items
+                WHERE local_date = ? AND timezone = ?
+                GROUP BY risk_label
+                ORDER BY count DESC, risk_label ASC
+                LIMIT 5
+                """,
+                (date_key, tz_name),
+            ).fetchall()
+            top_rows = connection.execute(
+                """
+                SELECT repo, stars, decision, risk_label
+                FROM items
+                WHERE local_date = ? AND timezone = ?
+                ORDER BY rank ASC
+                LIMIT 5
+                """,
+                (date_key, tz_name),
+            ).fetchall()
+            trend = dict(row)
+            trend["categories"] = [dict(item) for item in category_rows]
+            trend["risk_labels"] = [dict(item) for item in risk_rows]
+            trend["top"] = [dict(item) for item in top_rows]
+            trends.append(trend)
+        return trends
+
+
+def render_trend_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "No trend rows found.\n"
+    lines = ["date        repos  stars  study  verify  avoid  high  top_categories"]
+    lines.append("----------  -----  -----  -----  ------  -----  ----  --------------")
+    for row in rows:
+        categories = ", ".join(f"{item['category']}:{item['count']}" for item in row["categories"][:3])
+        lines.append(
+            f"{row['local_date']:<10}  {row['included']:<5}  {row['stars']:<5}  "
+            f"{row['study']:<5}  {row['verify']:<6}  {row['avoid']:<5}  {row['high_risk']:<4}  {categories}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 def report_json_files(output_dir: Path) -> list[Path]:
@@ -906,19 +1092,150 @@ def render_daily_summary(report: dict[str, Any], paths: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_explain_markdown(item: dict[str, Any]) -> str:
+    lines = [
+        f"# {item['repo']} 深度解析",
+        "",
+        item["summary"],
+        "",
+        f"- URL: {item['html_url']}",
+        f"- Star: {item['stars']}",
+        f"- Fork: {item['forks']}",
+        f"- Language: {item['language']}",
+        f"- Category: {item['category']}",
+        f"- Decision: {item['decision']}",
+        f"- Risk: {item['risk_label']}",
+        "",
+        "## 项目定位",
+        "",
+        item["position"],
+        "",
+        "## 核心机制",
+        "",
+        item["mechanism"],
+        "",
+        "## 证据强弱",
+        "",
+        item["evidence"],
+        "",
+        "## 风险判断",
+        "",
+        item["risk"],
+        "",
+        "## 下一步",
+        "",
+        item["action"],
+        "",
+        "## 风险命中",
+        "",
+    ]
+    if item["risk_hits"]:
+        lines.extend([f"- {hit}" for hit in item["risk_hits"]])
+    else:
+        lines.append("- 未命中强风险规则")
+    return "\n".join(lines) + "\n"
+
+
+def fetch_single_repo(client: GitHubClient, full_name: str) -> dict[str, Any]:
+    if "/" not in full_name:
+        raise SystemExit("repo must be in owner/name form")
+    owner, name = full_name.split("/", 1)
+    owner_q = urllib.parse.quote(owner, safe="")
+    name_q = urllib.parse.quote(name, safe="")
+    return client.request_json(f"{API_ROOT}/repos/{owner_q}/{name_q}")
+
+
+def explain_repo(args: argparse.Namespace) -> int:
+    try:
+        tz = ZoneInfo(args.timezone)
+    except Exception as exc:
+        raise SystemExit(f"Invalid --timezone value: {args.timezone}") from exc
+    client = GitHubClient(args.github_token or None)
+    repo = fetch_single_repo(client, args.repo)
+    readmes = {repo["full_name"]: ""}
+    fetched = fetch_readmes(client, [repo], 1)
+    readmes.update(fetched)
+    created = parse_github_time(repo["created_at"])
+    analyses = analyze_repositories(
+        [repo],
+        readmes,
+        created - timedelta(seconds=1),
+        created + timedelta(seconds=1),
+        tz,
+        1,
+        0,
+    )
+    if not analyses:
+        raise SystemExit("failed to analyze repository")
+    item = analyses[0].__dict__
+    payload = json.dumps(item, ensure_ascii=False, indent=2) if args.format == "json" else render_explain_markdown(item)
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(payload, encoding="utf-8")
+    print(payload)
+    return 0
+
+
+def doctor(args: argparse.Namespace) -> int:
+    checks: list[dict[str, Any]] = []
+    py_ok = sys.version_info >= (3, 10)
+    checks.append({"name": "python", "ok": py_ok, "detail": sys.version.split()[0]})
+    output_dir = Path(args.output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        probe = output_dir / ".doctor-write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        checks.append({"name": "output_dir", "ok": True, "detail": str(output_dir)})
+    except OSError as exc:
+        checks.append({"name": "output_dir", "ok": False, "detail": str(exc)})
+
+    token_present = bool(args.github_token or os.environ.get("GITHUB_TOKEN"))
+    checks.append({"name": "github_token", "ok": token_present, "detail": "present" if token_present else "missing; anonymous mode"})
+    try:
+        client = GitHubClient(args.github_token or None)
+        rate = client.request_json(f"{API_ROOT}/rate_limit")
+        core = rate.get("resources", {}).get("core", {})
+        detail = f"remaining={core.get('remaining')} limit={core.get('limit')}"
+        checks.append({"name": "github_api", "ok": True, "detail": detail})
+    except Exception as exc:
+        checks.append({"name": "github_api", "ok": False, "detail": str(exc)})
+
+    timer_path = Path("/etc/systemd/system/github-new-repo-radar.timer")
+    systemd_runtime = Path("/run/systemd/system")
+    if systemd_runtime.exists():
+        checks.append({"name": "systemd_timer_file", "ok": timer_path.exists(), "detail": str(timer_path)})
+    else:
+        checks.append({"name": "systemd_timer_file", "ok": True, "detail": "not a systemd host; skipped"})
+    print(json.dumps({"ok": all(item["ok"] for item in checks if item["name"] != "github_token"), "checks": checks}, ensure_ascii=False, indent=2))
+    return 0 if all(item["ok"] for item in checks if item["name"] != "github_token") else 1
+
+
 def write_outputs(report: dict[str, Any], output_dir: Path, output_name: str, fmt: str) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    targets = ["html", "json", "md"] if fmt == "all" else [fmt]
+    targets = ["html", "json", "md", "csv"] if fmt == "all" else [fmt]
     paths: dict[str, str] = {}
     for target in targets:
         path = output_dir / f"{output_name}.{target}"
+        latest_path = output_dir / f"latest.{target}"
         if target == "html":
-            path.write_text(render_html(report), encoding="utf-8")
+            content = render_html(report)
+            path.write_text(content, encoding="utf-8")
+            latest_path.write_text(content, encoding="utf-8")
         elif target == "json":
-            path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            content = json.dumps(report, ensure_ascii=False, indent=2)
+            path.write_text(content, encoding="utf-8")
+            latest_path.write_text(content, encoding="utf-8")
         elif target == "md":
-            path.write_text(render_markdown(report), encoding="utf-8")
+            content = render_markdown(report)
+            path.write_text(content, encoding="utf-8")
+            latest_path.write_text(content, encoding="utf-8")
+        elif target == "csv":
+            content = render_csv(report)
+            path.write_text(content, encoding="utf-8")
+            latest_path.write_text(content, encoding="utf-8")
         paths[target] = str(path)
+        paths[f"latest_{target}"] = str(latest_path)
     return paths
 
 
@@ -927,6 +1244,8 @@ def stdout_payload(report: dict[str, Any], fmt: str) -> str:
         return json.dumps(report, ensure_ascii=False, indent=2)
     if fmt == "md":
         return render_markdown(report)
+    if fmt == "csv":
+        return render_csv(report)
     return render_html(report)
 
 
@@ -970,7 +1289,7 @@ def run(args: argparse.Namespace) -> int:
     start_utc, end_utc = utc_window_for_local_day(target, tz)
     client = GitHubClient(args.github_token or None)
     days = utc_dates_between(start_utc, end_utc)
-    repos = search_repositories(client, days, args.search_page_size)
+    repos = search_repositories(client, days, args.search_page_size, args.pages, args.page_delay)
 
     candidate_repos = []
     for repo in repos:
@@ -995,6 +1314,9 @@ def run(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     output_name = args.output_name or f"github-new-repos-{target.isoformat()}"
     report = report_to_dict(analyses, target, args.timezone, start_utc, end_utc, len(repos))
+    report["query"]["pages"] = args.pages
+    report["query"]["page_delay"] = args.page_delay
+    apply_history_nav(report, output_dir)
     paths = write_outputs(report, output_dir, output_name, args.format)
 
     db_path: Path | None = None
@@ -1037,12 +1359,27 @@ def history(args: argparse.Namespace) -> int:
     return 0
 
 
+def trend(args: argparse.Namespace) -> int:
+    rows = load_trends(Path(args.db), args.days)
+    if args.format == "json":
+        print(json.dumps({"ok": True, "db": args.db, "trends": rows}, ensure_ascii=False, indent=2))
+    else:
+        print(render_trend_table(rows), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "run":
         return run(args)
     if args.command == "history":
         return history(args)
+    if args.command == "trend":
+        return trend(args)
+    if args.command == "explain":
+        return explain_repo(args)
+    if args.command == "doctor":
+        return doctor(args)
     raise SystemExit(f"Unknown command: {args.command}")
 
 
@@ -1151,6 +1488,9 @@ HTML_TEMPLATE = r"""<!doctype html>
     .pattern b { display: block; font-size: 15px; margin-bottom: 8px; }
     .pattern span { display: block; color: var(--muted); font-size: 13px; }
     .source { margin-top: 18px; color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
+    .nav-links { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+    .nav-links a, .nav-links span { border:1px solid var(--line); border-radius:8px; padding:8px 10px; background:var(--card); color:var(--ink); font-size:13px; font-weight:800; text-decoration:none; }
+    .nav-links span { color:var(--muted); font-weight:700; }
     @media (max-width: 1120px) { .topbar, .grid, .selected, .visuals { grid-template-columns: 1fr; } .list { max-height: 420px; } }
     @media (max-width: 760px) { .shell { width: min(100% - 20px, 1480px); padding-top: 10px; } .metrics, .analysis, .pattern-grid, .toolbar { grid-template-columns: 1fr; } .filters { justify-content: flex-start; } .selected { padding: 16px; } .lane { grid-template-columns: 1fr; } .score { grid-template-columns: 78px minmax(0, 1fr) 38px; } }
   </style>
@@ -1226,6 +1566,13 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     function renderMetrics() {
       const m = report.metrics;
+      const nav = report.history_nav || {};
+      const navHtml = [
+        `<a href="${esc(nav.index || 'index.html')}">历史索引</a>`,
+        nav.previous ? `<a href="${esc(nav.previous)}">上一份 ${esc(nav.previous_date)}</a>` : `<span>上一份</span>`,
+        nav.next ? `<a href="${esc(nav.next)}">下一份 ${esc(nav.next_date)}</a>` : `<span>下一份</span>`,
+        `<a href="${esc(nav.latest || 'latest.html')}">最新报告</a>`
+      ].join("");
       document.getElementById("metrics").innerHTML = [
         metric("进入解析的新仓库", m.repositories),
         metric("样本累计 star", m.stars),
@@ -1233,7 +1580,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         metric("强核验或高风险", m.avoid)
       ].join("");
       document.getElementById("scope").textContent = `${report.query.local_date} ${report.query.timezone} | created_at 严格过滤 | 旧项目更新不算`;
-      document.getElementById("source").innerHTML = `<span>UTC 窗口：${esc(report.query.utc_window[0])} 至 ${esc(report.query.utc_window[1])}</span><span>来源：GitHub Search API、README、仓库元数据</span>`;
+      document.getElementById("source").innerHTML = `<span>UTC 窗口：${esc(report.query.utc_window[0])} 至 ${esc(report.query.utc_window[1])}</span><span>分页：${esc(report.query.pages || 1)} 页；页间隔：${esc(report.query.page_delay ?? 0)} 秒</span><span>来源：GitHub Search API、README、仓库元数据</span><div class="nav-links">${navHtml}</div>`;
     }
     function renderFilters() {
       document.getElementById("filters").innerHTML = filters.map((f) => `<button class="filter ${state.filter === f.id ? "active" : ""}" data-filter="${f.id}" type="button">${f.label}</button>`).join("");

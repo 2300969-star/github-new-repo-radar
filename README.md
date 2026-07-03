@@ -55,9 +55,11 @@ HTML dashboard / JSON for LLM / Markdown report
 **研究**
 
 - **严格新项目口径**：只按 `created_at` 过滤目标日期，避免把老项目当成今日新项目。
+- **分页抓取带延迟**：支持 `--pages` 与 `--page-delay`，扩大候选范围，同时避免连续请求过猛。
 - **项目解析而非标题翻译**：输出项目定位、核心机制、证据强弱、风险判断和下一步建议。
 - **多格式输出**：同一次运行可生成 HTML、JSON、Markdown。
 - **历史库与索引页**：默认写入 SQLite，并生成 `reports/index.html`，按日期浏览历史报告。
+- **趋势与单仓解析**：支持 `trend` 查看历史趋势，支持 `explain owner/repo` 深度解析单个仓库。
 - **LLM 友好**：JSON stdout 适合直接传给 Hermes、Codex、Claude Code 或其他 agent。
 - **时区明确**：支持 `Asia/Shanghai`、`America/Los_Angeles` 等 IANA 时区。
 
@@ -90,7 +92,12 @@ python3 -m github_new_repo_radar run \
 reports/github-new-repos-YYYY-MM-DD.html
 reports/github-new-repos-YYYY-MM-DD.json
 reports/github-new-repos-YYYY-MM-DD.md
+reports/github-new-repos-YYYY-MM-DD.csv
 reports/github-new-repos-YYYY-MM-DD.summary.md
+reports/latest.html
+reports/latest.json
+reports/latest.md
+reports/latest.csv
 reports/latest-summary.md
 reports/index.html
 reports/history.sqlite
@@ -121,6 +128,12 @@ macOS 本地也可以直接运行：
 python3 -m github_new_repo_radar history --db ./reports/history.sqlite
 ```
 
+检查环境：
+
+```bash
+python3 -m github_new_repo_radar doctor --output-dir ./reports
+```
+
 ## LLM / Agent 调用
 
 机器可读 JSON：
@@ -149,6 +162,19 @@ github-new-repo-radar run \
   --stdout \
   --output-dir /tmp/github-radar \
   | jq '{query, metrics, top: [.items[:10][] | {rank, repo, stars, category, decision, risk_label, summary, action}]}'
+```
+
+分页抓取更多候选，并在每页之间等待 2 秒：
+
+```bash
+github-new-repo-radar run \
+  --date today \
+  --timezone Asia/Shanghai \
+  --pages 3 \
+  --page-delay 2.0 \
+  --limit 30 \
+  --format all \
+  --output-dir ./reports
 ```
 
 ## 输出字段
@@ -219,6 +245,53 @@ github-new-repo-radar history --db ./reports/history.sqlite --limit 14
 github-new-repo-radar history --db ./reports/history.sqlite --format json
 ```
 
+查看趋势：
+
+```bash
+github-new-repo-radar trend --db ./reports/history.sqlite --days 14
+```
+
+趋势 JSON：
+
+```bash
+github-new-repo-radar trend --db ./reports/history.sqlite --days 30 --format json
+```
+
+每个日报 HTML 顶部会带日期切换入口：
+
+```text
+历史索引 / 上一份 / 下一份 / 最新报告
+```
+
+固定入口适合 Nginx、Hermes 或其他系统读取：
+
+```text
+reports/latest.html
+reports/latest.json
+reports/latest.md
+reports/latest.csv
+```
+
+## 单仓深度解析
+
+解析任意仓库：
+
+```bash
+github-new-repo-radar explain owner/repo
+```
+
+输出 JSON：
+
+```bash
+github-new-repo-radar explain owner/repo --format json
+```
+
+写入文件：
+
+```bash
+github-new-repo-radar explain owner/repo --output ./reports/explain-owner-repo.md
+```
+
 ## VPS 定时运行
 
 项目自带 systemd timer，每天 **09:10 Asia/Shanghai** 自动生成报告。
@@ -278,8 +351,10 @@ github-new-repo-radar run --github-token "$GITHUB_TOKEN"
 --date              YYYY-MM-DD 或 today
 --timezone          IANA 时区名，例如 Asia/Shanghai、America/Los_Angeles
 --limit             输出多少个项目
+--pages             每个 UTC 边界日抓取多少页 GitHub Search 结果
+--page-delay        每页请求之间等待多少秒，默认 1.5
 --min-stars         过滤低于指定 star 的仓库
---format            html、json、md、all
+--format            html、json、md、csv、all
 --output-dir        输出目录
 --output-name       自定义输出文件名 stem
 --readme-limit      读取前多少个项目的 README
@@ -290,6 +365,15 @@ github-new-repo-radar run --github-token "$GITHUB_TOKEN"
 --no-readme         跳过 README，只用元数据快速生成
 --stdout            把指定格式同时打印到 stdout
 --github-token      GitHub token；默认读取 GITHUB_TOKEN
+```
+
+其他命令：
+
+```bash
+github-new-repo-radar history --db ./reports/history.sqlite
+github-new-repo-radar trend --db ./reports/history.sqlite
+github-new-repo-radar explain owner/repo
+github-new-repo-radar doctor --output-dir ./reports
 ```
 
 ## 风险评分说明
