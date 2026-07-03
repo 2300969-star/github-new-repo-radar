@@ -394,15 +394,45 @@ github-new-repo-radar doctor --output-dir ./reports
 
 建议把它当作第一轮筛查器：它帮你挑出值得读的项目，也帮你快速避开不该直接运行的项目。
 
+## 更新日志（Changelog）
+
+### 2026-07-03 · v0.3.0
+
+- 新增分页抓取参数 `--pages` 与 `--page-delay`，扩大候选范围，同时避免连续请求过猛。
+- HTML 日报新增日期切换入口，可在历史索引、上一份、下一份和最新报告之间跳转。
+- 新增 CSV 输出，并固定生成 `latest.html`、`latest.json`、`latest.md`、`latest.csv`、`latest-summary.md`。
+- 新增 `trend` 命令，从 SQLite 历史库读取多日趋势，不消耗 GitHub API。
+- 新增 `explain owner/repo` 单仓深度解析，适合 LLM/agent 对指定项目做二次判断。
+- 新增 `doctor` 环境检查，快速确认 Python、输出目录、GitHub API、systemd timer 状态。
+- 改进风险规则，降低 README 文档自身触发高风险误判的概率。
+- 改进 GitHub API 限流与仓库不可访问时的错误输出，JSON 模式返回 `ok: false`、`error` 和 `hint`。
+- VPS 部署脚本会自动创建 `/usr/local/bin/github-new-repo-radar` 包装器，不依赖系统级 `pip install -e .`。
+
+### 2026-07-03 · v0.2.0
+
+- 新增 SQLite 历史库 `history.sqlite`，记录每天的运行结果和项目条目。
+- 新增 `reports/index.html` 历史报告索引页。
+- 新增 `latest-summary.md` 与每日报告摘要，方便 Hermes、Codex 或其他 agent 快速读取结论和路径。
+- 新增 systemd service/timer 与每日运行脚本，支持 VPS 定时生成报告。
+- README 改成更完整的产品说明：背景、快速开始、LLM 调用、VPS 部署、风险说明和 Roadmap。
+
+### 2026-07-03 · v0.1.0
+
+- 初始版本：严格按 GitHub `created_at` 过滤目标日期新建仓库，旧项目更新、push 或涨 star 不计入。
+- 支持按 star 降序输出今日新项目列表。
+- 支持读取 README 与 GitHub 元数据，生成项目定位、核心机制、证据强弱、风险判断和下一步建议。
+- 支持 HTML、JSON、Markdown 三种报告输出。
+- 内置高风险下载、凭证/资金、批量私信/抓取等启发式风险信号识别。
+
 ## 更新计划（Roadmap）
 
 以下为规划方向，不代表时间承诺。欢迎以 issue / PR 参与共建。
 
 **更强的数据源**
 
-- 支持分页抓取更多候选仓库，而不是只取 UTC 边界日的前 100 个。
 - 增加 GitHub GraphQL 查询模式，减少 REST API 限流影响。
 - 基于 SQLite 历史库增加 star 增长、fork 增长和风险变化趋势图。
+- 增加可配置的语言、topic、license 与最小 star 组合筛选预设。
 
 **更好的项目解析**
 
