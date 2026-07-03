@@ -57,6 +57,7 @@ HTML dashboard / JSON for LLM / Markdown report
 - **严格新项目口径**：只按 `created_at` 过滤目标日期，避免把老项目当成今日新项目。
 - **项目解析而非标题翻译**：输出项目定位、核心机制、证据强弱、风险判断和下一步建议。
 - **多格式输出**：同一次运行可生成 HTML、JSON、Markdown。
+- **历史库与索引页**：默认写入 SQLite，并生成 `reports/index.html`，按日期浏览历史报告。
 - **LLM 友好**：JSON stdout 适合直接传给 Hermes、Codex、Claude Code 或其他 agent。
 - **时区明确**：支持 `Asia/Shanghai`、`America/Los_Angeles` 等 IANA 时区。
 
@@ -89,6 +90,10 @@ python3 -m github_new_repo_radar run \
 reports/github-new-repos-YYYY-MM-DD.html
 reports/github-new-repos-YYYY-MM-DD.json
 reports/github-new-repos-YYYY-MM-DD.md
+reports/github-new-repos-YYYY-MM-DD.summary.md
+reports/latest-summary.md
+reports/index.html
+reports/history.sqlite
 ```
 
 安装成系统命令：
@@ -108,6 +113,12 @@ macOS 本地也可以直接运行：
 
 ```bash
 ./run_today.command
+```
+
+查看历史运行记录：
+
+```bash
+python3 -m github_new_repo_radar history --db ./reports/history.sqlite
 ```
 
 ## LLM / Agent 调用
@@ -170,6 +181,81 @@ verify  有看点，但要先核验源码、权限、安全边界或可行性
 avoid   高风险或低可信模式，不建议下载/运行
 ```
 
+## 历史库与索引页
+
+每次 `run` 默认会写入 SQLite：
+
+```text
+reports/history.sqlite
+```
+
+并自动生成历史索引：
+
+```text
+reports/index.html
+```
+
+如果你只想生成一次性文件，不写数据库：
+
+```bash
+github-new-repo-radar run \
+  --date today \
+  --timezone Asia/Shanghai \
+  --format all \
+  --output-dir ./reports \
+  --no-db \
+  --no-index
+```
+
+查看最近 14 次运行：
+
+```bash
+github-new-repo-radar history --db ./reports/history.sqlite --limit 14
+```
+
+输出 JSON：
+
+```bash
+github-new-repo-radar history --db ./reports/history.sqlite --format json
+```
+
+## VPS 定时运行
+
+项目自带 systemd timer，每天 **09:10 Asia/Shanghai** 自动生成报告。
+
+假设项目位于 `/opt/github-new-repo-radar`：
+
+```bash
+cd /opt/github-new-repo-radar
+sudo scripts/install_systemd_timer.sh
+```
+
+手动运行一次：
+
+```bash
+sudo systemctl start github-new-repo-radar.service
+```
+
+查看定时器：
+
+```bash
+systemctl list-timers github-new-repo-radar.timer
+```
+
+查看日志：
+
+```bash
+journalctl -u github-new-repo-radar.service -n 80 --no-pager
+```
+
+默认输出：
+
+```text
+/opt/github-new-repo-radar/reports/index.html
+/opt/github-new-repo-radar/reports/latest-summary.md
+/opt/github-new-repo-radar/reports/history.sqlite
+```
+
 ## GitHub Token
 
 不配置 token 也能用，但 GitHub 匿名 API 有较低限额。服务器长期调用建议设置：
@@ -197,6 +283,10 @@ github-new-repo-radar run --github-token "$GITHUB_TOKEN"
 --output-dir        输出目录
 --output-name       自定义输出文件名 stem
 --readme-limit      读取前多少个项目的 README
+--db                SQLite 历史库路径；默认 <output-dir>/history.sqlite
+--no-db             不写 SQLite
+--no-index          不生成 reports/index.html
+--summary-file      指定简明 Markdown 摘要路径
 --no-readme         跳过 README，只用元数据快速生成
 --stdout            把指定格式同时打印到 stdout
 --github-token      GitHub token；默认读取 GITHUB_TOKEN
@@ -224,7 +314,7 @@ github-new-repo-radar run --github-token "$GITHUB_TOKEN"
 
 - 支持分页抓取更多候选仓库，而不是只取 UTC 边界日的前 100 个。
 - 增加 GitHub GraphQL 查询模式，减少 REST API 限流影响。
-- 支持缓存上次结果，用于对比 star 增长、fork 增长和风险变化。
+- 基于 SQLite 历史库增加 star 增长、fork 增长和风险变化趋势图。
 
 **更好的项目解析**
 
@@ -235,5 +325,5 @@ github-new-repo-radar run --github-token "$GITHUB_TOKEN"
 **更方便的部署**
 
 - 提供 Dockerfile。
-- 提供 cron/systemd 示例，定时生成每日 HTML/JSON。
-- 可选生成静态站点索引页，按日期浏览历史报告。
+- 增加 Telegram / 飞书 / 邮件推送适配器。
+- 可选生成公网静态站点，按日期浏览历史报告。

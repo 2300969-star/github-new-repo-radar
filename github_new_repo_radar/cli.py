@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import sqlite3
 import sys
 import textwrap
 import urllib.error
@@ -150,8 +151,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     run.add_argument("--output-dir", default="./radar-output", help="directory for generated files")
     run.add_argument("--output-name", default="", help="file stem, default github-new-repos-{date}")
     run.add_argument("--github-token", default="", help="optional token; defaults to GITHUB_TOKEN env")
+    run.add_argument("--db", default="", help="SQLite history path; default: <output-dir>/history.sqlite")
+    run.add_argument("--no-db", action="store_true", help="do not write the SQLite history database")
+    run.add_argument("--no-index", action="store_true", help="do not generate the reports index.html")
+    run.add_argument("--summary-file", default="", help="write a concise Markdown summary to this path")
     run.add_argument("--no-readme", action="store_true", help="skip README fetching")
     run.add_argument("--stdout", action="store_true", help="print the selected format to stdout after writing files")
+
+    history = subparsers.add_parser("history", help="show stored run history from SQLite")
+    history.add_argument("--db", default="./radar-output/history.sqlite", help="SQLite history path")
+    history.add_argument("--limit", type=int, default=14, help="number of runs to show")
+    history.add_argument("--format", choices=["table", "json"], default="table", help="output format")
 
     args = parser.parse_args(argv)
     if args.command is None:
@@ -634,6 +644,268 @@ def render_html(report: dict[str, Any]) -> str:
     return HTML_TEMPLATE.replace("__REPORT_JSON__", data)
 
 
+def default_db_path(output_dir: Path, requested: str) -> Path:
+    return Path(requested) if requested else output_dir / "history.sqlite"
+
+
+def init_history_db(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runs (
+            local_date TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            generated_at TEXT NOT NULL,
+            utc_start TEXT NOT NULL,
+            utc_end TEXT NOT NULL,
+            raw_candidates INTEGER NOT NULL,
+            included INTEGER NOT NULL,
+            stars INTEGER NOT NULL,
+            study INTEGER NOT NULL,
+            verify INTEGER NOT NULL,
+            avoid INTEGER NOT NULL,
+            high_risk INTEGER NOT NULL,
+            report_json TEXT NOT NULL,
+            PRIMARY KEY (local_date, timezone)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS items (
+            local_date TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            repo TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            stars INTEGER NOT NULL,
+            forks INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            risk_label TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            action TEXT NOT NULL,
+            html_url TEXT NOT NULL,
+            item_json TEXT NOT NULL,
+            PRIMARY KEY (local_date, timezone, repo)
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_runs_generated_at ON runs(generated_at)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_items_repo ON items(repo)")
+
+
+def store_report(db_path: Path, report: dict[str, Any]) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    query = report["query"]
+    metrics = report["metrics"]
+    with sqlite3.connect(db_path) as connection:
+        init_history_db(connection)
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO runs (
+                local_date, timezone, generated_at, utc_start, utc_end, raw_candidates,
+                included, stars, study, verify, avoid, high_risk, report_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                query["local_date"],
+                query["timezone"],
+                report["generated_at"],
+                query["utc_window"][0],
+                query["utc_window"][1],
+                int(query["raw_candidates"]),
+                int(query["included"]),
+                int(metrics["stars"]),
+                int(metrics["study"]),
+                int(metrics["verify"]),
+                int(metrics["avoid"]),
+                int(metrics["high_risk"]),
+                json.dumps(report, ensure_ascii=False),
+            ),
+        )
+        connection.execute(
+            "DELETE FROM items WHERE local_date = ? AND timezone = ?",
+            (query["local_date"], query["timezone"]),
+        )
+        connection.executemany(
+            """
+            INSERT OR REPLACE INTO items (
+                local_date, timezone, repo, rank, stars, forks, category, decision,
+                risk_label, summary, action, html_url, item_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    query["local_date"],
+                    query["timezone"],
+                    item["repo"],
+                    int(item["rank"]),
+                    int(item["stars"]),
+                    int(item["forks"]),
+                    item["category"],
+                    item["decision"],
+                    item["risk_label"],
+                    item["summary"],
+                    item["action"],
+                    item["html_url"],
+                    json.dumps(item, ensure_ascii=False),
+                )
+                for item in report["items"]
+            ],
+        )
+
+
+def load_history(db_path: Path, limit: int) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    with sqlite3.connect(db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        init_history_db(connection)
+        rows = connection.execute(
+            """
+            SELECT local_date, timezone, generated_at, included, stars, study, verify, avoid, high_risk
+            FROM runs
+            ORDER BY local_date DESC, generated_at DESC
+            LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def report_json_files(output_dir: Path) -> list[Path]:
+    return sorted(output_dir.glob("github-new-repos-*.json"), reverse=True)
+
+
+def reports_for_index(output_dir: Path, db_path: Path | None = None, limit: int = 60) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any]] = []
+    if db_path and db_path.exists():
+        with sqlite3.connect(db_path) as connection:
+            connection.row_factory = sqlite3.Row
+            init_history_db(connection)
+            rows = connection.execute(
+                "SELECT report_json FROM runs ORDER BY local_date DESC, generated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            for row in rows:
+                reports.append(json.loads(row["report_json"]))
+    if not reports:
+        for path in report_json_files(output_dir)[:limit]:
+            try:
+                reports.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                continue
+    return reports
+
+
+def render_index_html(reports: list[dict[str, Any]]) -> str:
+    generated = datetime.now(timezone.utc).isoformat()
+    cards = []
+    for report in reports:
+        query = report["query"]
+        metrics = report["metrics"]
+        stem = f"github-new-repos-{query['local_date']}"
+        top_items = report["items"][:5]
+        top_html = "".join(
+            f"<li><a href=\"{escape(item['html_url'])}\">{escape(item['repo'])}</a>"
+            f" <span>{item['stars']} stars · {escape(item['decision'])} · {escape(item['risk_label'])}</span></li>"
+            for item in top_items
+        )
+        cards.append(
+            f"""
+            <article class="card">
+              <div class="card-head">
+                <h2>{escape(query['local_date'])}</h2>
+                <a class="open" href="{stem}.html">打开报告</a>
+              </div>
+              <div class="metrics">
+                <span><b>{metrics['repositories']}</b> repos</span>
+                <span><b>{metrics['stars']}</b> stars</span>
+                <span><b>{metrics['study']}</b> study</span>
+                <span><b>{metrics['avoid']}</b> avoid</span>
+              </div>
+              <ol>{top_html}</ol>
+            </article>
+            """
+        )
+    cards_html = "\n".join(cards) if cards else '<p class="empty">暂无报告。运行 CLI 后会自动生成索引。</p>'
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GitHub New Repo Radar Reports</title>
+  <style>
+    :root {{ --bg:#f6f2e9; --surface:#fffaf1; --card:#fff; --ink:#17211f; --muted:#68736f; --line:#d8d0c1; --teal:#0f766e; --red:#b42318; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:var(--bg); color:var(--ink); font-family:Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }}
+    main {{ width:min(1180px, calc(100% - 28px)); margin:0 auto; padding:28px 0 48px; }}
+    header {{ background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:24px; margin-bottom:16px; }}
+    h1 {{ margin:0 0 8px; font-size:clamp(28px, 5vw, 48px); line-height:1.05; }}
+    p {{ color:var(--muted); margin:0; }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:14px; }}
+    .card {{ background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:18px; }}
+    .card-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }}
+    h2 {{ margin:0; font-size:22px; }}
+    .open {{ background:var(--ink); color:white; border-radius:8px; padding:8px 11px; text-decoration:none; font-weight:800; font-size:13px; }}
+    .metrics {{ display:grid; grid-template-columns:repeat(4, 1fr); gap:8px; margin:12px 0; }}
+    .metrics span {{ border:1px solid var(--line); background:var(--card); border-radius:8px; padding:10px; color:var(--muted); font-size:12px; }}
+    .metrics b {{ display:block; color:var(--ink); font-size:18px; }}
+    ol {{ margin:12px 0 0; padding-left:22px; }}
+    li {{ margin:8px 0; }}
+    li a {{ color:var(--teal); font-weight:800; text-decoration:none; }}
+    li span {{ color:var(--muted); font-size:13px; }}
+    .empty {{ background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:18px; }}
+    footer {{ margin-top:18px; color:var(--muted); font-size:12px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>GitHub New Repo Radar</h1>
+      <p>历史报告索引。只统计目标日期新建仓库，旧项目更新不计入。</p>
+    </header>
+    <section class="grid">{cards_html}</section>
+    <footer>Generated at {escape(generated)}</footer>
+  </main>
+</body>
+</html>
+"""
+
+
+def write_index(output_dir: Path, db_path: Path | None = None) -> Path:
+    reports = reports_for_index(output_dir, db_path)
+    path = output_dir / "index.html"
+    path.write_text(render_index_html(reports), encoding="utf-8")
+    return path
+
+
+def render_daily_summary(report: dict[str, Any], paths: dict[str, str]) -> str:
+    query = report["query"]
+    metrics = report["metrics"]
+    lines = [
+        f"# GitHub New Repo Radar Summary - {query['local_date']}",
+        "",
+        f"- Timezone: {query['timezone']}",
+        f"- UTC window: {query['utc_window'][0]} to {query['utc_window'][1]}",
+        f"- Repositories: {metrics['repositories']}",
+        f"- Total stars: {metrics['stars']}",
+        f"- Decisions: study {metrics['study']} / verify {metrics['verify']} / avoid {metrics['avoid']}",
+        "",
+        "## Top Projects",
+    ]
+    for item in report["items"][:10]:
+        lines.append(
+            f"{item['rank']}. [{item['repo']}]({item['html_url']}) - {item['stars']} stars - "
+            f"{item['category']} - {item['decision']} - {item['risk_label']}"
+        )
+        lines.append(f"   - {item['summary']}")
+        lines.append(f"   - Next: {item['action']}")
+    lines.extend(["", "## Report Paths"])
+    for key, value in paths.items():
+        lines.append(f"- {key}: `{value}`")
+    return "\n".join(lines) + "\n"
+
+
 def write_outputs(report: dict[str, Any], output_dir: Path, output_name: str, fmt: str) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     targets = ["html", "json", "md"] if fmt == "all" else [fmt]
@@ -656,6 +928,36 @@ def stdout_payload(report: dict[str, Any], fmt: str) -> str:
     if fmt == "md":
         return render_markdown(report)
     return render_html(report)
+
+
+def render_history_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "No history rows found.\n"
+    headers = ["date", "tz", "repos", "stars", "study", "verify", "avoid", "high_risk"]
+    table_rows = [
+        [
+            row["local_date"],
+            row["timezone"],
+            str(row["included"]),
+            str(row["stars"]),
+            str(row["study"]),
+            str(row["verify"]),
+            str(row["avoid"]),
+            str(row["high_risk"]),
+        ]
+        for row in rows
+    ]
+    widths = [len(header) for header in headers]
+    for row in table_rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    lines = [
+        "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)),
+        "  ".join("-" * width for width in widths),
+    ]
+    for row in table_rows:
+        lines.append("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
+    return "\n".join(lines) + "\n"
 
 
 def run(args: argparse.Namespace) -> int:
@@ -690,9 +992,28 @@ def run(args: argparse.Namespace) -> int:
         args.limit,
         args.min_stars,
     )
+    output_dir = Path(args.output_dir)
     output_name = args.output_name or f"github-new-repos-{target.isoformat()}"
     report = report_to_dict(analyses, target, args.timezone, start_utc, end_utc, len(repos))
-    paths = write_outputs(report, Path(args.output_dir), output_name, args.format)
+    paths = write_outputs(report, output_dir, output_name, args.format)
+
+    db_path: Path | None = None
+    if not args.no_db:
+        db_path = default_db_path(output_dir, args.db)
+        store_report(db_path, report)
+        paths["db"] = str(db_path)
+
+    if not args.no_index:
+        index_path = write_index(output_dir, db_path)
+        paths["index"] = str(index_path)
+
+    summary_path = Path(args.summary_file) if args.summary_file else output_dir / f"{output_name}.summary.md"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(render_daily_summary(report, paths), encoding="utf-8")
+    latest_summary = output_dir / "latest-summary.md"
+    latest_summary.write_text(summary_path.read_text(encoding="utf-8"), encoding="utf-8")
+    paths["summary"] = str(summary_path)
+    paths["latest_summary"] = str(latest_summary)
 
     summary = {
         "ok": True,
@@ -707,10 +1028,21 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def history(args: argparse.Namespace) -> int:
+    rows = load_history(Path(args.db), args.limit)
+    if args.format == "json":
+        print(json.dumps({"ok": True, "db": args.db, "history": rows}, ensure_ascii=False, indent=2))
+    else:
+        print(render_history_table(rows), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "run":
         return run(args)
+    if args.command == "history":
+        return history(args)
     raise SystemExit(f"Unknown command: {args.command}")
 
 

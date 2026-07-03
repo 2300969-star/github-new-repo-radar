@@ -6,3 +6,6 @@ build/
 *.egg-info/
 radar-output/
 reports/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

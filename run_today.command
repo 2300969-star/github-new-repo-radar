@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 python3 -m github_new_repo_radar run \
   --date today \
   --timezone Asia/Shanghai \
-  --limit 12 \
+  --limit 20 \
   --format all \
   --output-dir ./reports
 

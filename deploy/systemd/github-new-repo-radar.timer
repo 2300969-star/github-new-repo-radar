@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GitHub New Repo Radar every day at 09:10 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 01:10:00 UTC
+Persistent=true
+Unit=github-new-repo-radar.service
+
+[Install]
+WantedBy=timers.target
