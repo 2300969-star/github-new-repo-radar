@@ -1145,13 +1145,49 @@ def fetch_single_repo(client: GitHubClient, full_name: str) -> dict[str, Any]:
     return client.request_json(f"{API_ROOT}/repos/{owner_q}/{name_q}")
 
 
+def runtime_error_hint(error: RuntimeError) -> str:
+    message = str(error).lower()
+    if "rate limit" in message or "api rate limit exceeded" in message:
+        return "GitHub API 被限流。请设置 GITHUB_TOKEN 环境变量，或稍后重试。"
+    if "not found" in message or "404" in message:
+        return "请确认仓库名是 owner/name，且仓库公开可访问。"
+    return "请检查网络、GitHub API 状态、仓库名或 GITHUB_TOKEN 权限。"
+
+
+def write_optional_output(path: str, payload: str) -> None:
+    if not path:
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(payload, encoding="utf-8")
+
+
 def explain_repo(args: argparse.Namespace) -> int:
     try:
         tz = ZoneInfo(args.timezone)
     except Exception as exc:
         raise SystemExit(f"Invalid --timezone value: {args.timezone}") from exc
     client = GitHubClient(args.github_token or None)
-    repo = fetch_single_repo(client, args.repo)
+    try:
+        repo = fetch_single_repo(client, args.repo)
+    except RuntimeError as exc:
+        error_payload = {
+            "ok": False,
+            "repo": args.repo,
+            "error": str(exc),
+            "hint": runtime_error_hint(exc),
+        }
+        if args.format == "json":
+            payload = json.dumps(error_payload, ensure_ascii=False, indent=2)
+        else:
+            payload = (
+                f"# {args.repo} 解析失败\n\n"
+                f"- error: {error_payload['error']}\n"
+                f"- hint: {error_payload['hint']}\n"
+            )
+        write_optional_output(args.output, payload)
+        print(payload)
+        return 2
     readmes = {repo["full_name"]: ""}
     fetched = fetch_readmes(client, [repo], 1)
     readmes.update(fetched)
@@ -1169,9 +1205,7 @@ def explain_repo(args: argparse.Namespace) -> int:
         raise SystemExit("failed to analyze repository")
     item = analyses[0].__dict__
     payload = json.dumps(item, ensure_ascii=False, indent=2) if args.format == "json" else render_explain_markdown(item)
-    if args.output:
-        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(payload, encoding="utf-8")
+    write_optional_output(args.output, payload)
     print(payload)
     return 0
 
@@ -1370,16 +1404,21 @@ def trend(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.command == "run":
-        return run(args)
-    if args.command == "history":
-        return history(args)
-    if args.command == "trend":
-        return trend(args)
-    if args.command == "explain":
-        return explain_repo(args)
-    if args.command == "doctor":
-        return doctor(args)
+    try:
+        if args.command == "run":
+            return run(args)
+        if args.command == "history":
+            return history(args)
+        if args.command == "trend":
+            return trend(args)
+        if args.command == "explain":
+            return explain_repo(args)
+        if args.command == "doctor":
+            return doctor(args)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        print(f"hint: {runtime_error_hint(exc)}", file=sys.stderr)
+        return 2
     raise SystemExit(f"Unknown command: {args.command}")
 
 

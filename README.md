@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
   <img src="https://img.shields.io/badge/python-3.10%2B-2459a6.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/dependencies-zero-0f766e.svg" alt="Zero dependencies">
-  <img src="https://img.shields.io/badge/output-HTML%20%7C%20JSON%20%7C%20Markdown-a16207.svg" alt="HTML JSON Markdown">
+  <img src="https://img.shields.io/badge/output-HTML%20%7C%20JSON%20%7C%20Markdown%20%7C%20CSV-a16207.svg" alt="HTML JSON Markdown CSV">
 </p>
 
 # GitHub New Repo Radar
@@ -285,6 +285,8 @@ github-new-repo-radar explain owner/repo
 ```bash
 github-new-repo-radar explain owner/repo --format json
 ```
+
+如果 GitHub API 限流或仓库不可访问，JSON 会返回 `ok: false`、`error` 和 `hint`，便于 LLM / agent 判断是否需要设置 `GITHUB_TOKEN` 或稍后重试。
 
 写入文件：
 
